@@ -1,0 +1,353 @@
+---
+title: "The Exemplar Model - Hill Climbing Version"
+author: "Amanda Lien and John Paul Minda"
+date: "March 18, 2018"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+bibliography: catmodels.bib
+affiliation: The University of Western Ontario
+---
+#Summary
+This notebook describes the formulation of an exemplar model of categorization, the Generalized Context Model. Full specification of the model itself can be found elsewhere [@nosofsky1984choice;@nosofsky1986attention @nosofsky2011generalized]. This model has been used in cognitive psychological research to make predictions about how participants will learn to classify objects and belonging to one or more category. The primary assumption of the exemplar model is that categories are represented in the mind by stored exemplar traces, rather that rules or prototypes. 
+
+This document describes the development and use of an R script that reads in a text file of classification probabilities (usually obtained from behavioural testing), a text file that corresponds to the stimuli in the experiment, and a text file that corresponds to the exemplars of each category. The model then uses a hill-climbing algorithm to adjust the parameters and minimize the fitting error. The model will reports the best-fitting parameters, the fit index, and the prediction of the model. 
+
+NOTE: Also posted with our toolbox are sample text files for a small experiment. These files are used throughout our notebook. The model is also available as a stand-alone R scripts that is the same as the code in this notebook.
+
+**Fun asside**: I programmed a version of this model in 1998 using Turbo Pascal 7.0, later updated to REALBasic/Xojo, then a slow R script with loops, and finally with A. Lien's help, an R version with matrices that minimizes running time. The underlying math is the same.
+
+#Functions
+
+The model uses several functions to do its work.
+
+**randomSum** is a function that will be used by the main code to randomly produce a set of initial weights.
+
+PARAMETERS:
+
+N = what the values will sum to (in our case it is 1.0)
+
+M = # of values (i.e. for 6 traits, M = 6)
+
+```{r}
+randomSum <- function( N, M, sd = 0.1 )
+{
+  vec <- rnorm(N, M/N, sd)
+  vec / sum(vec) * M
+}
+```
+
+**exceeds** is a function that determines whether changing the sensitivity or weight parameter exceeds our defined limits. For example, if a current weight is 0.00 and the code attempts to decrement, the exceeds function will prevent this from occurring. An upper and lower threshold is defined for both sensitivity and weight.
+
+In our case, we have defined 0 and 1 as being the lowest and highest possible weights respectively (because they must all sum to 1.0) and 1.99 and 14.01 as the sensitivity limits.
+
+PARAMETERS
+
+increment: 1 = increase a weight or sensitivity; 0 = decrease
+
+type: 0 = change sensitivity; non-zero value = change weight parameter corresponding to the value
+
+- ie. type = 3 means alter the 3rd weight parameter
+
+x: value of the current weight parameter or sensitivity
+
+
+```{r}
+exceeds <- function ( increment, type, x )
+{
+  error<-FALSE
+  if (increment == 0)
+  {
+    if ( (type == 0 && x < 2) | (type > 0 && x < 0.01 ) )
+    {error<-TRUE}
+  }
+  else
+  {
+    if ( (type == 0 && x > 14) | (type > 0 && x > 0.99 ) )
+    {error<-TRUE}
+  }
+  return( error )
+}
+```
+
+#Running the Model
+
+##Load Files
+
+As a first step, the user must specify 3 text files within the code
+
+* **exemplars** This is a .txt file containing rows of the training exemplars. These exemplars are assumed to correspond to the participants category representation. In the present case, the exemplars are the same as our stimuli.
+
+* **stim**: This is a .txt file containing all of the to-be-categorized exemplars in the study. These are typically ordered with dimensions as columns and stimuli as rows. The first *n* rows are items that belong to Category A, then the next *n* rows are items that belong to Category B. Additional transfer stimuli (no assigned category) would follow. Continuing with our 6-weight example, the file may resemble 6dStm.txt.
+
+* **observations**: A .txt file containing the observed data that will be fitted. Each row corresponds to a different subject, condition, or trial, etc. The number of elements in a row will be equal to the number of columns in the stim file (above).- i.e. continuing with our example, if I am fitting 10 subjects, the code may resemble 6dObs.txt
+
+- These are proportions describing how often the subject classified a stimulus as Category A
+
+```{r}
+# text file containing exemaplars that were classified
+exemplars<-read.table("SampleDatasets/6dExem.txt")
+
+# text file containing observed data to be fit
+observations<-read.table("SampleDatasets/6dObs.txt") 
+
+# text file containing training stimuli
+stim<-read.table("SampleDatasets/6dStm.txt") 
+```
+
+##Creating the data matrices
+
+1. Determine and store the number of dimensions (weights), stim, and subjects (6, 14, and 10 respectively in our example case)
+2. Stores Category A and B exemplars into their own respective matrices
+- Assumes that the first half of training set is Category A and second half is Category B
+- Assumes that training sets are equal in size
+3. Determine number of training exemplars in each
+4. Store the stimuli data and observational data in their own matrices
+
+```{r}
+# determines number of subjects/trials, dimensions (traits)
+numTraits<-dim( exemplars )[2]
+numStm<-dim( stim )[1]
+numObs<-dim( observations )[1]
+numExemplars<-dim( exemplars )[1]
+
+# assumes that the first half of training set is Category A and the rest is Category B
+# also assumes that there is an equal amt of A and B trainer sets
+exemA<-matrix( unlist(exemplars[ 1:(numExemplars/2), 1:numTraits]), 
+               numExemplars/2, numTraits )
+exemB<-matrix( unlist(exemplars[ (numExemplars/2+1):numExemplars, 1:numTraits ] ), 
+               numExemplars/2, numTraits)
+numExemA<-dim(exemA)[1]
+numExemB<-dim(exemB)[1]
+
+# insert experimental data into matrix
+stmData<-matrix( unlist(stim[ 1:numStm, 1:numTraits]), 
+                 numStm, numTraits )
+obsData<-matrix( unlist(observations[ 1:numObs, 1:numStm ]), 
+                 numObs, numStm )
+```
+
+##Generate Starting Configurations
+
+The *while* loop uses the *randomSum* function to generate a set of random weights and only terminates if all weights are positive values.
+
+```{r}
+makeWeights<-TRUE
+while (makeWeights)
+{
+  makeWeights<-FALSE
+  weightTable<-matrix( randomSum( numTraits, 1.0 ), 
+                       numObs , numTraits, byrow=TRUE )
+  for ( row in seq(numObs) )
+  {
+    if ( length(which(weightTable[row, 1:numTraits] < 0)) != 0 )
+    { makeWeights<-TRUE }
+  }
+}
+```
+
+##More Starting Configurations
+
+* **RMSD** is an an array that will continually be updated as the fit becomes more optimal. It is initialized to the high value of 1000 and continually minimized
+
+* **sens** corresponds to the similarity scaling parameter (*c*) described in [@nosofsky1986attention]. the scaling parameter is taken as an index of salience in psychological space. This parameter is estimated or can be fixed. Sensitivities are initialized randomly to 1 or 2
+
+* **prob** is based on the observed data, stores the probabilities (classifying as Category A) that the prototype model would predict. Initialized to null value
+
+* **whatChange** will later determine which parameter is changed (weight/sensitivity) will be made each round of the hill-climbing algorithm.
+
+```{r}
+RMSD<-array( 1000, dim = numObs )
+# user can change starting sensitivity here
+sens<-array( sample( c(1:2), numObs, replace = TRUE), dim = numObs ) 
+prob<-matrix( NA, numObs, numStm )
+# will later determine what change (weight/sensitivity) will be made to each trial
+whatChange<-array( NA, dim = numObs ) 
+```
+
+##Generating Predictions
+
+The current parameters are used to generate a set of predictions.
+
+The model can be formulated with three equations. First, the distance between the item $i$ and the exemplar $j$ is calculated by comparing the two stimuli along each weighted dimension $k$.
+
+\[  
+d_{ij}=\biggl[\sum_{k=1}^N w_k|x_{ik}-x_{jk}|^r\biggr]^{1/r}
+\]  
+
+In this case, a dimension usually corresponds to some variable feature (e.g., if a set of stimuli appear as either green or blue, colour would be a dimension) The GCM assumes that the dimensions exist in a psychological space that is representative of physical space. The dimensions of this psychological space can be derived from similarity scaling studies, or by making a simplifying assumption that each perceptual component will be interpreted as a dimension. The value of $r$ is used to reflect two common ways to calculate distance. When $r=1$ the model uses a city-block distance metric which is appropriate for separable-dimension stimuli.  When $r=2$ the model uses a Euclidean distance metric which is appropriate for integral-dimension stimuli. Each dimension can be weighted to reflect how much attention or importance it is given by the model. In the present case, each attentional weight ($w$) varies between 0.0 (no attention) and 1.0 (exclusive attention). Attentional weights are constrained to sum to 1.0 across all the dimensions. The results of these weighted comparisons are summed across the dimensions to get the distance between the item and the exemplars
+
+
+This distance ($d_ij$) between the item and the items is then converted into a measure of similarity ($\eta_{ij}$) by taking:
+
+\[ 
+\eta_{ij}=e^{-cd_{ij}}
+\] 
+
+which gives a measure of similarity of an item $i$ to a exemplar $j$. It is the exponent in Equation 2 that allows for the exponential-decay of similarity (meaning that trait dissimilarities tend to decrease psychological similarity very steeply at first, and then more gradually later on) and allows for the close correspondence between the prototype model and the **Generalized Context Model** of Nosofsky [@nosofsky2011generalized]. The exponent is distance $d_ij$  multiplied by the scaling or sensitivity parameter $c$. This parameter is a freely-estimated parameter that can take on values from 1 to  $\infty$  and reflects the steepness of the decay of similarity around the prototype. Low values of $c$ indicate a gradual, more linear decay. High values of $c $ indicate a steep, exponential decay. Generally, higher values of the sensitivity parameter will result in stronger category endorsements for typical items and lower values of $c$ will result in classification probabilities that are closer to chance. 
+
+The process of item-to-exemplar comparison is repeated for all the training exemplars. 
+
+The similarity of each stimulus is averaged across all exemplars in training set A and so forth and stored in the first column of the first matrix [first exemplar's matrix] of **distancesA**. This is then repeated for those in training set B and similarly stored in **distancesB**
+
+
+Once the item has been compared to the Category A exemplars, the probability of a Category A response is calculated for each stimulus. Category A similarity ($\eta_{ij_A}$) is divided by the sum of Category A and Category B similarity to generate the model's predicted probability of a Category A response ($P(R_A)$) for stimulus ($S_i$) as shown in the probabilistic choice rule in Equation 3. 
+\[ 
+P(R_A|S_i)=\frac{\eta_{ij_A}} {\eta_{ij_A}+\eta_{ij_B}}
+\] 
+
+##The Hill-Climbing Algorithm
+
+
+The following loop determines and applies changes to be made to the weight or sensitivity parameters in order to minimize the RMSD between the observed data and the predicted data. The loop relies on a counter to keep making adjustments in an attempt to minimize the RMSD, Once the counter reaches value (user should choose - we have found 1000 is an ideal balance b/w execution time and RMSD minimization), the program stops trying to minimize RMSD. Each weight and sensitivity has an equal chance of being altered. For example, if there are 6 weights, there is a 1 in 7 chance that any weight or the sensitivity will be selected to be modified in a given round/trial
+
+The following parameters and objects are introduced and manipulated. 
+
+* **newWeights** stores the weights determined by a round/trial of hill-climbing. This only happens if the RMSD for this round is less than what has been previously stored will these newWeights be inserted into weightTable
+
+* **newSens** similar logic to newWeights but for sensitivity
+
+For a single trial/round, each subject (each row of observational data) will have its own randomized parameter (a weight or its sensitivity) and direction (either increase or decrease that parameter by 0.01). This change is assessed by the **exceeds** function (above) to ensure the sum of weights has not gone out of bounds. If change is acceptable, another random weight parameter is selected to be oppositely incremented/decremented. If this change is also deemed valid by the exceeds function, the algorithm proceeds. Otherwise, it will exit the loop and the counter will increment by 1.
+
+Note: the second parameter change is not performed nor required if the parameter selected to be changed is sensitivity. 
+
+Now that changes have been made, the algorithm initializes an array that will store the RMSDs and probabilities that correspond to the new changes. Then the following calculates the distance, similarity, in order to determine the probabilities (for all subjects). These probabilities are stored in **predictedProb**. Then, the RMSDs for each subject are calculated and stored in **testRMSD**.
+
+
+If any newly calculated RMSD is less than what was previously stored, reset the counter to 
+0. Otherwise, no changes are made and counter increments by 1.
+
+
+```{r}
+counter<-0
+
+while ( counter < 1000 ) # <-- user chooses when to stop
+{
+  newWeights = weightTable
+  newSens = sens
+  
+  # randomly determine what change to make for each round of hill-climbing
+  whatChange<-sample( 0:numTraits, numObs, replace = TRUE) 
+  
+# for each trial/subject, apply a change and calculate the RMSD 
+  for ( currentTrial in seq( numObs )) 
+  {  
+    direction<-sample( c(0:1), 1 ) # determines whether to increase(1)/decrease(0)
+    if ( whatChange[currentTrial] == 0 ) # if zero, change sensitivitity
+    {
+      if (!exceeds(direction, whatChange[currentTrial], sens[currentTrial]) )
+        { if (direction == 0)
+          { newSens[currentTrial]<-sens[currentTrial] - 0.01 }
+          else
+          { newSens[currentTrial]<-sens[currentTrial] + 0.01 }
+        }
+    }
+    # CHANGE WEIGHT:
+    # if the change in weight surpasses limits, terminate the loop and move onto next trial
+    # if weight change is possible, make change and randomly choose another weight to compensate with
+    else
+    {
+      if ( !exceeds(direction, whatChange[currentTrial], newWeights[currentTrial, whatChange[currentTrial]]) )
+        { if (direction == 0) { newWeights[ currentTrial, whatChange[currentTrial] ]<-newWeights[ currentTrial, whatChange[currentTrial] ] - 0.01 }
+          else { newWeights[ currentTrial, whatChange[currentTrial] ]<-newWeights[ currentTrial, whatChange[currentTrial] ] + 0.01 }
+          secondCounter<-0
+# looks for and applies change to weight randomly chosen to compensate with          
+          while ( secondCounter < 20 && secondCounter >= 0 ) 
+          {
+            secondCounter<-secondCounter + 1
+            changeTo<-sample(seq(numTraits)[!seq(numTraits) %in% whatChange[currentTrial]], 1) # which other weight will be used to compensate
+            swapDirection<-seq(0,1)[!seq(0,1) %in% direction]
+            if ( !exceeds(swapDirection, changeTo, newWeights[currentTrial,changeTo]) ) # ensures that the compensating weight change doesn't surpass limits
+            {
+              if (swapDirection == 1)
+              {
+                newWeights[ currentTrial, changeTo ]<-weightTable[ currentTrial, changeTo ] + 0.01
+                secondCounter<-(-1)
+              }
+              else
+              { 
+                newWeights[ currentTrial, changeTo ]<-weightTable[ currentTrial, changeTo ] - 0.01
+                secondCounter<-(-1)
+              }
+            }
+          }
+          if ( secondCounter == 20 )
+          {
+            if ( direction == 0 )
+            { newWeights[ currentTrial, whatChange[currentTrial] ]<-newWeights[ currentTrial, whatChange[currentTrial] ] + 0.01 }
+            else
+            { newWeights[ currentTrial, whatChange[currentTrial] ]<-newWeights[ currentTrial, whatChange[currentTrial] ] - 0.01 }
+          }
+        }
+    }
+  }
+
+  testRMSD<-array( dim = numObs ) # will contain calculated RMSDs to compare to pre-existing RMSDs
+  predictedProb<-matrix( NA, numObs, numStm) # predicted probabilities of choosing category A based on model and new parameters
+  
+  # finds the weighted differences between all exemplars to experimental data and stores
+  # by storage and calculations in multi-dimensional arrays, where each 3rd dimension represents a trainer 
+  distancesA<-array( dim = c(numStm, numTraits, numExemA) )
+  distancesB<-array( dim = c(numStm, numTraits, numExemB) )
+  for ( eachTrial in seq(numObs) )
+  {
+    for ( eachTrainer in seq(numExemA) ) # for each trainer
+    {
+      distancesA[ 1:numStm, 1:numTraits, eachTrainer ]<-abs( matrix( exemA[eachTrainer,1:numTraits], numStm, numTraits, byrow = TRUE ) - stmData ) * matrix(newWeights[ eachTrial, 1:numTraits ], numStm, numTraits, byrow = TRUE)
+      distancesB[ 1:numStm, 1:numTraits, eachTrainer ]<-abs( matrix( exemB[eachTrainer,1:numTraits], numStm, numTraits, byrow = TRUE ) - stmData ) * matrix(newWeights[ eachTrial, 1:numTraits ], numStm, numTraits, byrow = TRUE)
+      
+      for ( row in seq(numStm) ) # calculates similarity of each stimuli to category A and B across all exemplars
+      {
+        distancesA[ row, 1, eachTrainer ]<-exp( -newSens[eachTrial]*sum(distancesA[row, 1:numTraits, eachTrainer]) )
+        distancesB[ row, 1, eachTrainer ]<-exp( -newSens[eachTrial]*sum(distancesB[row, 1:numTraits, eachTrainer]) )
+      }
+    }
+    
+    for ( eachRow in seq(numStm) ) # calculates means of sums of all exemplars and stores in first column of first matrix
+    {
+      distancesA[ eachRow, 1, 1 ]<-sum(distancesA[ eachRow, 1, 1:numExemA ])
+      distancesB[ eachRow, 1, 1 ]<-sum(distancesB[ eachRow, 1, 1:numExemB ])
+    }
+    
+    # calculate and store probability of classifying stimulus as category A, and then RMSD
+    predictedProb[ eachTrial, 1:numStm ]<-distancesA[ 1:numStm, 1, 1 ] / (distancesA[ 1:numStm, 1, 1 ] + distancesB[ 1:numStm, 1, 1 ])
+    testRMSD[ eachTrial ]<-sqrt( mean((obsData[eachTrial, 1:numStm] - predictedProb[eachTrial, 1:numStm])^2) )
+  }
+
+  if ( length(which(testRMSD < RMSD)) == 0 )
+  { counter <- counter + 1 }
+  else
+  {
+    for ( eachChange in which(testRMSD < RMSD) )
+    {
+      weightTable[ eachChange, 1:numTraits ]<-newWeights[ eachChange, 1:numTraits ]
+      sens[ eachChange ] <- newSens[ eachChange ]
+      prob[ eachChange, 1:numStm ]<-predictedProb[ eachChange, 1:numStm ]
+      
+    }
+    RMSD[ which(testRMSD < RMSD) ] <- testRMSD[ which(testRMSD < RMSD) ]
+    counter <- 0
+  }
+}
+```
+
+#Model Output
+
+When the model is finished running, it will print the values of the exemplar-model-fitted parameters, RMSDs, and probabilities (that a subject categorizes something as Category A). These can be plotted, analyzed, and/or compared with the fit of other models.
+
+```{r}
+print("Sensitivities")
+print(sens)
+
+print("Weights")
+print(weightTable)
+
+print("RMSDs")
+print(RMSD)
+
+print("Probabilities of Categorizing as A")
+print(prob)
+```
+
+#References
